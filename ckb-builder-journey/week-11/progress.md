@@ -1,47 +1,52 @@
 # Week 11 Progress
 
-**Date:** 23 - 29 June 2026
+**Date:** 11 - 16 June 2026
 **Track:** CKBuilder — Community Keeps Building (Nervos)
-**Project:** Cellora — managed indexing and query layer for CKB
+**Project:** ckb-crosschain-verification — trustless verification of CKB state inside other chains
 
 ---
 
 ## Overview
 
-With the stack live on the VPS and the frontend on Vercel, this week shifted from shipping features to hardening the build and release pipeline. We ran a production-readiness review of the backend, then closed the two biggest operational gaps it surfaced: there was no container image and no continuous integration. We added a reproducible multi-stage Docker build and a GitHub Actions workflow that lints, tests, and builds the image on every push.
+This week was a design week on a new project alongside Cellora. The premise: a contract on Ethereum (or Solana, or a Cosmos chain) cannot answer "did transaction T happen on CKB?" without trusting a bridge multisig, an oracle, or a centralized API. CKB's FlyClient light client (RFC 44/45) already makes that verifiable on phones and in browsers, but nobody has ported that verification *into another chain's execution environment*. The output of the week is a full engineering design document for an SDK and relayer that does exactly that, published to Nervos Talk for community review and sharpened by two rounds of feedback folded back into the design.
 
 ---
 
 ## What shipped
 
-### cellora — Containerization and CI/CD
+### ckb-crosschain-verification — engineering design document
 
-- **Multi-stage Dockerfile:** A `rust:1.82-bookworm` builder compiles both binaries (`cellora-api` and `cellora-indexer`) and a `debian:bookworm-slim` runtime ships them in one image. The build is fully offline — SQLx compile-time query checking reads the committed `.sqlx/` cache, so no database is needed to build. BuildKit cache mounts persist the cargo registry and target directory for fast incremental rebuilds, and the container runs as a non-root user. Because every TLS client is rustls, the runtime image needs only `ca-certificates` — no OpenSSL.
-- **One image, two services:** Rather than two images, the single image carries both binaries on `PATH` and defaults to the API; the indexer is selected by overriding the container command. Same artifact, different command in compose or Kubernetes.
-- **`.dockerignore`:** Keeps `target/`, `.git/`, docs, and secrets out of the build context while preserving `migrations/` and the `.sqlx/` cache that the build depends on.
-- **GitHub Actions CI:** A `lint-and-test` job runs `rustfmt --check`, `clippy --workspace --all-targets`, and `cargo test --workspace` against a live Postgres service container; a `docker-build` job builds the production image offline. The two jobs together also act as a drift detector for the query cache.
+Wrote the repository README and a ~500-line design doc covering the protocol end to end:
 
-### Backend production-readiness review
+- **Problem and goals.** A destination-chain contract should be able to verify, trustlessly: (G1) a CKB header is part of the heaviest chain, (G2) a transaction is included in a verified block, and (G3) a cell is an output of a verified transaction — at a cost target under ~500k gas per verified message on EVM, with no committee, multisig, or governance key in the verification path. Safety depends on no one; liveness depends on at least one honest relayer existing.
+- **Primitives.** Documented the pieces we build on: the CKB header chain and Eaglesong PoW, the chain root MMR (RFC 44), FlyClient difficulty-weighted sampling (RFC 45), and the CBMT transaction/cell commitment path.
+- **Architecture.** Four components — a Rust relayer (header tailer, MMR maintainer, proof builder, per-chain submitter), a ZK proving service for the EVM path, on-chain verifier contracts per destination chain, and a TypeScript + Rust client SDK with a two-call developer experience (`proveTransaction`, `submitAndVerify`).
+- **Core protocol.** Specified the heavy tip-update flow (sampled PoW + MMR-root transition + cumulative-difficulty reorg rule) and the cheap, frequent inclusion-proof flow.
+- **ZK layer.** Compared SP1 vs RISC Zero vs a custom Halo2/Plonky3 circuit and chose **SP1 first**, because the zkVM guest can reuse `ckb-light-client` verification logic nearly verbatim as a `no_std` crate. Wrote the guest program spec — the linchpin is deriving sample heights via Fiat–Shamir from the new tip hash so a prover cannot grind which heights it proves.
+- **Build plan.** A staged plan from Phase 0 de-risking spikes (Eaglesong cycles in SP1, blake2b inclusion gas on EVM, incremental MMR maintenance against mainnet) through a Base-testnet vertical slice, production hardening, and a second native runtime (Solana) to prove the code-reuse bet — each phase with explicit kill criteria.
 
-Audited the backend against a "would I trust this in production" bar. The encouraging findings: no `unwrap`/`expect`/`panic` in non-test code (enforced by `deny` lints), compile-time-checked SQL, Argon2-hashed credentials, atomic reorg rollback with an audit log, and Prometheus plus OpenTelemetry wired in. The honest gaps logged for follow-up: the rate limiter currently fails open if Redis is unreachable, webhook deliveries are not yet retried, and there is no deployment runbook.
+### Published for community review
 
-### Docs cleanup
+Posted the design as **"Design notes: verifying CKB state inside other chains (EVM-first, built on RFC 44/45)"** on Nervos Talk ([thread](https://talk.nervos.org/t/design-notes-verifying-ckb-state-inside-other-chains-evm-first-built-on-rfc-44-45/10372)). The write-up framed the split between rare, expensive zkVM-backed tip updates and cheap, frequent (~60–100k gas) inclusion proofs, the Fiat–Shamir trick that makes RFC 45 sampling non-interactive on-chain, and four explicit asks for the community: sampling parameterization, cell-liveness proofs, Eaglesong proving cost, and whether anyone actually needs this at today's volumes.
 
-Earlier in the period we corrected the testing guide to match the single-network backend and removed stale multi-network and pricing references that no longer reflect the product.
+### External review folded into the design
+
+- **Asset trust taxonomy (credit: Neon).** Corrected an early framing error: the SDK removes bridge trust on the CKB→destination leg, but it does nothing about custody trust *upstream* of CKB. CKB-native xUDT and Bitcoin-issued RGB++ assets are trustless end to end with the SDK; custodially wrapped BTC (e.g. ccBTC) is not. Committed the project to claim discipline and to a flagship demo using a genuinely-trustless asset.
+- **Checkpoint-binding soundness (credit: T_Silva, Chiral — CKB→Cardano).** A reply on the Nervos Talk thread named a soundness class any checkpoint-amortized light client shares: membership against a relayer-maintained checkpoint is insufficient on its own, because a header valid under an earlier checkpoint can be replayed after the checkpoint advances. Folded the fix into a new security section — a mandatory two-sided height bound (`min_confirmations ≤ tip − height ≤ W`), verification only against the live canonical MMR root, and cumulative-work-only advancement from a single genesis anchor — and agreed with them to treat CKB-side Eaglesong proving as shared infrastructure across our different target chains.
 
 ---
 
 ## Key learnings
 
-- **Offline image builds vs. test-time query checking:** The committed `.sqlx/` cache covers library and binary code, so the image builds without a database. But the integration tests carry their own `query!` macros that are not in the cache, so CI needs a live Postgres at compile time for the test targets. Splitting this into an offline image build plus a live-DB test job means the image build doubles as a check that the query cache has not drifted from the code.
-- **Self-provisioning tests simplify CI:** Because the integration suites spin up their own throwaway Postgres and Redis via `testcontainers`, the CI runner only needs Docker available — there is no separate fixture orchestration to maintain.
-- **rustls keeps the runtime slim:** Choosing rustls over native-tls across reqwest, SQLx, and the OTLP exporter means the runtime image avoids an OpenSSL dependency entirely, which keeps the slim base genuinely small and the dependency surface smaller.
+- **The reusable crown jewel is the verification crate.** Picking a Rust zkVM (SP1) over a hand-written circuit means the consensus-critical verification logic is one `no_std` crate that is shared between the zkVM guest (EVM path) and native verifiers (Solana, CosmWasm). Audit it once; recompiling for a second zkVM backend is a swap, not a rewrite.
+- **Fiat–Shamir is where a light-client design lives or dies.** Sample heights must be derived from the freshly-mined tip hash so the prover can't pick favorable samples; this grinding-resistance bound folds directly into the λ security parameter. It is the one place a subtle, silent error would be catastrophic — flagged as an open question for someone who has worked on RFC 45 to sign off.
+- **Honest scoping beats a bigger claim.** The asset trust taxonomy correction narrowed the marketing claim but made it true: "the SDK removes the bridge trust, not the custody trust." Writing that distinction into the reference contracts' surfaced metadata is part of the design, not an afterthought.
+- **Review before benchmarking.** The Chiral project already has working Eaglesong proving from its CKB→Cardano leg, so the first Phase 0 action became "walk through their accumulator design and Eaglesong proving before committing original benchmarking" rather than reimplementing shared infrastructure.
 
 ---
 
 ## Plan for next week
 
-- Resolve the GitHub Actions billing block so the workflow actually executes, then fix anything the first real run surfaces.
-- Decide fail-open vs. fail-closed for the rate limiter under a Redis outage and record the decision as an ADR.
-- Implement webhook delivery retries with exponential backoff so failed deliveries are no longer silently dropped.
-- Write `docs/deployment.md` and an operations runbook capturing the VPS deploy and recovery steps.
+- Open the Phase 0 de-risk conversation with T_Silva (Chiral): shared CKB-side Eaglesong proving infrastructure vs. per-target verifiers, and the chain-accumulator proving-cost trade they flagged.
+- Scope the Eaglesong-in-SP1 spike (cycles per header, proving time for a 64-header update) against the written kill criteria.
+- Draft the cell-liveness question into its own note — inclusion proves a cell was *created*, not that it is currently *unspent*; decide whether to wait on an external live-set commitment from ongoing ZK-on-CKB research before building anything parallel.
