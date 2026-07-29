@@ -1,6 +1,6 @@
 # Week 17 Progress
 
-**Date:** 6 - 12 August 2026
+**Date:** 29 July 2026
 **Track:** CKBuilder — Community Keeps Building (Nervos)
 **Project:** Cellora — managed indexing and query layer for CKB
 
